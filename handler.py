@@ -1,65 +1,71 @@
-# handler.py
-import base64, io, os, subprocess, time, uuid
-from pathlib import Path
-
-import requests
+import os, time, base64, requests
 import runpod
 
-FAWKES_BIN = "/opt/fawkes/protection"  # from Dockerfile
+VPS_BASE   = os.environ.get("VPS_BASE", "http://127.0.0.1:8000")   # CHANGE to your VPS later
+VPS_TOKEN  = os.environ.get("VPS_TOKEN", "dev-local-secret-change-me")
+TIMEOUT_S  = int(os.environ.get("TIMEOUT_S", "180"))
+POLL_EVERY = float(os.environ.get("POLL_EVERY", "2.0"))
 
-def _save_image_from_input(job_input, work_dir: Path) -> Path:
-    img_path = work_dir / "input.jpg"  # binary accepts dir; format is set by flag
-    if "image_url" in job_input and job_input["image_url"]:
-        r = requests.get(job_input["image_url"], timeout=30)
-        r.raise_for_status()
-        img_path.write_bytes(r.content)
-    elif "image_b64" in job_input and job_input["image_b64"]:
-        img_path.write_bytes(base64.b64decode(job_input["image_b64"]))
+def upload_bytes(img_bytes: bytes, filename: str = "input.jpg") -> str:
+    files = {"file": (filename, img_bytes, "image/jpeg")}
+    headers = {"X-Auth-Token": VPS_TOKEN}
+    r = requests.post(f"{VPS_BASE}/Upload", files=files, headers=headers, timeout=60)
+    r.raise_for_status()
+    return r.text.strip()
+
+def poll_ready(image_id: str) -> bool:
+    headers = {"X-Auth-Token": VPS_TOKEN}
+    r = requests.get(f"{VPS_BASE}/query/{image_id}", headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.text.strip().upper() == "READY"
+
+def download(image_id: str) -> bytes:
+    headers = {"X-Auth-Token": VPS_TOKEN}
+    r = requests.get(f"{VPS_BASE}/download/{image_id}", headers=headers, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+def handler(event):
+    """
+    Input:
+    {
+      "image_base64": "<...>"    # OR
+      "image_url": "https://example.com/photo.jpg"
+    }
+    """
+    body = event.get("input", {}) or {}
+    image_b64 = body.get("image_base64")
+    image_url = body.get("image_url")
+
+    if not image_b64 and not image_url:
+        return {"error": "Provide image_base64 or image_url"}
+
+    # fetch bytes
+    if image_b64:
+        try:
+            img_bytes = base64.b64decode(image_b64)
+        except Exception:
+            return {"error": "Invalid base64"}
     else:
-        raise ValueError("Provide image_url or image_b64")
-    return img_path
+        resp = requests.get(image_url, timeout=30)
+        resp.raise_for_status()
+        img_bytes = resp.content
 
-def _call_fawkes(directory: Path, mode: str, fmt: str):
-    # Example CLI from the official README/release
-    # fawkes binary is named "protection", flags are same as pip CLI
-    cmd = [FAWKES_BIN, "-d", str(directory), "--mode", mode, "--format", fmt]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"Fawkes binary failed:\n{proc.stdout}")
-    # Fawkes writes output images next to input; pick the newest/ largest written
-    files = [p for p in directory.rglob("*") if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg"}]
-    if not files:
-        raise RuntimeError("Fawkes produced no files.")
-    files.sort(key=lambda p: (p.stat().st_mtime, p.stat().st_size), reverse=True)
-    return files[0]
+    # upload → get id
+    image_id = upload_bytes(img_bytes)
 
-def handler(job):
-    """
-    input: { image_url|image_b64, mode: low|mid|high (default low), format: png|jpg (default png) }
-    output: { image_b64, format, processing_ms, mode }
-    """
-    t0 = time.time()
-    try:
-        inp = job.get("input") or {}
-        mode = (inp.get("mode") or "low").lower()
-        fmt  = (inp.get("format") or "png").lower()
-        if mode not in {"low","mid","high"}: mode = "low"
-        if fmt not in {"png","jpg"}: fmt = "png"
+    # poll until ready
+    start = time.time()
+    while True:
+        if poll_ready(image_id):
+            break
+        if time.time() - start > TIMEOUT_S:
+            return {"error": "Processing timeout", "image_id": image_id}
+        time.sleep(POLL_EVERY)
 
-        work = Path("/tmp/in") / str(uuid.uuid4())
-        work.mkdir(parents=True, exist_ok=True)
-
-        _ = _save_image_from_input(inp, work)
-        out_path = _call_fawkes(work, mode, fmt)
-
-        b64 = base64.b64encode(out_path.read_bytes()).decode("utf-8")
-        return {
-            "image_b64": b64,
-            "format": out_path.suffix.replace(".","").lower(),
-            "processing_ms": int((time.time()-t0)*1000),
-            "mode": mode
-        }
-    except Exception as e:
-        return {"error": str(e), "processing_ms": int((time.time()-t0)*1000)}
+    # download result
+    out_bytes = download(image_id)
+    out_b64 = base64.b64encode(out_bytes).decode("utf-8")
+    return {"image_id": image_id, "image_base64": out_b64}
 
 runpod.serverless.start({"handler": handler})
