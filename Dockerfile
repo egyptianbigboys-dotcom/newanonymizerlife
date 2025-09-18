@@ -1,43 +1,35 @@
-# Stable base for TF 1.15.x wheels
-FROM python:3.7-bullseye
+# Small Python base just to run the handler
+FROM python:3.10-slim
 
-# System libs for Pillow and image IO
+# System deps for the Fawkes binary + image IO
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential git \
-    libjpeg-dev zlib1g-dev libpng-dev libtiff5 libopenjp2-7 libwebp-dev \
-    libgl1 libglib2.0-0 \
+    curl unzip ca-certificates \
+    libglib2.0-0 libgl1 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-ENV PIP_NO_CACHE_DIR=1 PIP_DEFAULT_TIMEOUT=1000
+ENV PIP_NO_CACHE_DIR=1
 
-# --- Pin the low-level stack FIRST (avoid source builds) ---
-# numpy 1.19.5 is the last manylinux wheel that plays well with TF1.x on Py3.7
-RUN python -m pip install --upgrade pip "setuptools<60" wheel \
- && python -m pip install -vv --only-binary=:all: \
-      "numpy==1.19.5" \
-      "Pillow==9.5.0" \
-      "scipy==1.4.1" \
-      "h5py==2.10.0"
+# --- Download Fawkes linux binary v0.3 ---
+# If the mirror ever changes, grab the link from the official release page.
+# We place the binary in /opt/fawkes and make it executable.
+RUN mkdir -p /opt/fawkes \
+ && curl -L -o /tmp/fawkes_linux.zip \
+      https://mirror.cs.uchicago.edu/fawkes/files/fawkes_binary_linux-v0.3.zip \
+ && unzip /tmp/fawkes_linux.zip -d /opt/fawkes \
+ && chmod +x /opt/fawkes/protection \
+ && rm -f /tmp/fawkes_linux.zip
 
-# --- TensorFlow 1.x + Keras 2.2.x + compat deps ---
-RUN python -m pip install -vv \
-      "tensorflow==1.15.5" \
-      "keras==2.2.5" \
-      "gast==0.2.2" \
-      "protobuf==3.20.*" \
-      "wrapt==1.14.1" \
-      "termcolor==1.1.0" \
-      "absl-py==0.9.0"
-
-# Now install ONLY your lightweight app deps from requirements.txt
+# Python deps: ONLY what your handler needs (no tensorflow, no fawkes)
 COPY requirements.txt .
-RUN python -m pip install -vv -r requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel \
+ && python -m pip install -r requirements.txt
 
-# Copy handler
+# App code
 COPY handler.py .
 
-# Runtime temp dirs
+# Runtime work dirs
 RUN mkdir -p /tmp/in /tmp/out
 
+# Default: start handler
 CMD ["python", "-u", "handler.py"]
